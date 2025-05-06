@@ -1,4 +1,3 @@
-% Initialize OpenDSS COM interface
 clc; clear all;
 DSSObj = actxserver('OpenDSSEngine.DSS');
 DSSObj.Start(0);  % Start DSS Engine
@@ -6,7 +5,7 @@ DSSText = DSSObj.Text;
 DSSCircuit = DSSObj.ActiveCircuit;
 
 % Load and compile the OpenDSS file
-DSSText.Command = 'compile (C:\\Users\\HP\\Desktop\\Sem 7\\FYP\\scenarios\\GridModel-bus13.dss)';
+DSSText.Command = 'compile (C:\\Users\\HP\\Desktop\\Sem 7\\FYP\\Final Eval\\GridModel-bus13.dss)';
 DSSText.Command = 'solve Mode=time stepsize=1h maxcontroliter=1000';
 DSSText.Command = 'Set Number=1'; % Simulate for 24 hours
 
@@ -40,23 +39,23 @@ summerLoadProfile = [0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.3, 1.5, 1.7, 2.0, 2.2, 2.5,
 winterLoadProfile = [0.4, 0.5, 0.7, 0.9, 1.1, 1.4, 1.7, 2.0, 2.2, 2.3, 2.4, 2.5, ...
                      2.5, 2.4, 2.3, 2.2, 2.0, 1.8, 1.7, 1.5, 1.3, 1.1, 0.9, 0.8];
 
-% Define the current month
-current_month = 'May'; 
+current_month = 'January'; 
 
-% Choose load profile based on the current month
+% Choosing load profile based on the current month
 if ismember(current_month, {'April', 'May', 'June', 'July', 'August', 'September', 'October'})
     loadProfile = summerLoadProfile;  % Use summer load profile
 else
     loadProfile = winterLoadProfile;  % Use winter load profile
 end
 
-% Defining peak hours based on the month
+
+% Define peak hours based on the month
 if ismember(current_month, {'April', 'May', 'June', 'July', 'August', 'September', 'October'})
-    peak_start = 18.5;  % 6:30 PM
-    peak_end = 22.5;    % 10:30 PM
+    peak_start = 18;  % 6:00 PM
+    peak_end = 22.5;  % 10:30 PM
 else
-    peak_start = 18;    % 6:00 PM
-    peak_end = 22;      % 10:00 PM
+    peak_start = 18;  % 6:00 PM
+    peak_end = 22;    % 10:00 PM
 end
 
 % Start and pause Simulink simulation
@@ -64,6 +63,7 @@ set_param('COSIMsim', 'SimulationCommand', 'start');
 set_param('COSIMsim', 'SimulationCommand', 'pause');
 SOC_value = SOC_init;
 
+% Initialize variables for energy tracking
 grid_energy_consumed = 0;  % Total energy consumed from grid (kWh)
 total_charging_energy = 0;  % Total charging energy (kWh)
 total_discharging_energy = 0;  % Total discharging energy (kWh)
@@ -77,18 +77,25 @@ load_kVAR = zeros(1, length(load_names));
 
 % Main simulation loop
 while simTime < endTime
-    current_hour = mod(simTime / 3600, 24);  % Current hour (0-23)
+    current_hour = mod(simTime / 3600, 24);  
     is_peak = (current_hour >= peak_start && current_hour <= peak_end);  % Check if current hour is peak hour
-
+    
+    % Determine if the current time is early or late off-peak
+    is_early_offpeak = (current_hour >= 0 && current_hour < 12);  % 12 AM to 12 PM
+    is_late_offpeak = (current_hour >= 12 && current_hour < 18);  % 12 PM to 6 PM
+    is_night = (current_hour >= 22.5 && current_hour < 24);  % 10:30 PM to midnight
+    
     % Dynamically retrieve SOC from OpenDSS
     DSSText.Command = '? Storage.BESS1.%stored';
     SOC_value = str2double(DSSText.Result);
     SOC_value = max(0, min(100, SOC_value));  % Constrain SOC between 0% and 100%
+
+    % Retrieve real-time voltages from OpenDSS
     V1 = DSSCircuit.AllNodeVmagPUByPhase(1)'; % Phase A
     V2 = DSSCircuit.AllNodeVmagPUByPhase(2)'; % Phase B
     V3 = DSSCircuit.AllNodeVmagPUByPhase(3)'; % Phase C
-
     load_scaling_factor = loadProfile(mod(simTime / 3600, 24) + 1);  % Scale by load profile
+
     for i = 1:length(load_names)
         DSSText.Command = ['? ', load_names{i}, '.kW'];
         load_kW(i) = str2double(DSSText.Result);
@@ -104,25 +111,32 @@ while simTime < endTime
     % Sum the individual scaled loads to get total power
     P_total = sum(load_kW);
     Q_total = sum(load_kVAR);
-
-    % Charging/Discharging logic
+    
     if is_peak && SOC_value > 0
-        % Discharge during peak hours
-        P_BESS = 50*load_scaling_factor;
+        % Discharge during peak hours with higher power
+        P_BESS = 10*load_scaling_factor;
         DSSText.Command = ['Storage.BESS1.kW=', num2str(P_BESS)];
         DSSText.Command = 'edit Storage.BESS1 State=DISCHARGING';
         total_discharging_energy = total_discharging_energy + (P_BESS * (time_step / 3600));  % Accumulate discharging energy
-    elseif ~is_peak && SOC_value < 100
-        % Charging during off-peak hours
-        P_BESS = -30*load_scaling_factor;  % Charging power
+    elseif is_early_offpeak && SOC_value < 100
+        % Moderate charging during early off-peak hours
+        P_BESS = -40*load_scaling_factor;
         DSSText.Command = ['Storage.BESS1.kW=', num2str(P_BESS)];
         DSSText.Command = 'edit Storage.BESS1 State=CHARGING';
+        %P_total=-P_total;
         total_charging_energy = total_charging_energy + (-P_BESS * (time_step / 3600));  
-        %P_total = -P_total;  % Energy flowing back to grid
-        grid_energy_consumed = grid_energy_consumed + (P_total * (time_step / 3600));  % kWh consumed from grid
-    elseif ~is_peak && SOC_value >= 100
-        % Discharge during off-peak hours if SOC is full
-        P_BESS = 60*load_scaling_factor;
+        grid_energy_consumed = grid_energy_consumed + (P_total * (time_step / 3600));  % Add to grid consumption
+    elseif is_late_offpeak && SOC_value < 100
+        % Reduced charging during late off-peak hours
+        P_BESS = -10*load_scaling_factor;
+        DSSText.Command = ['Storage.BESS1.kW=', num2str(P_BESS)];
+        DSSText.Command = 'edit Storage.BESS1 State=CHARGING';
+        %P_total=-P_total;
+        total_charging_energy = total_charging_energy + (-P_BESS * (time_step / 3600));  
+        grid_energy_consumed = grid_energy_consumed + (P_total * (time_step / 3600));  % Add to grid consumption
+    elseif is_night
+        % Discharge if battery is full during night or off-peak (after peak hours)
+        P_BESS = 10*load_scaling_factor;
         DSSText.Command = ['Storage.BESS1.kW=', num2str(P_BESS)];
         DSSText.Command = 'edit Storage.BESS1 State=DISCHARGING';
         total_discharging_energy = total_discharging_energy + (P_BESS * (time_step / 3600));  
@@ -144,18 +158,19 @@ while simTime < endTime
     DSSText.Command = 'solve';
     DSSText.Command = '? Storage.BESS1.%stored';
     SOC_value = str2double(DSSText.Result);
-    SOC_value = max(0, min(100, SOC_value)); 
+    SOC_value = max(0, min(100, SOC_value));  % Constrain SOC between 0% and 100%
 
     fprintf(['Time: %.2f hours, SOC: %.2f%%, P_BESS: %.2f kW, ', ...
              'P_total: %.2f kW, Q_total: %.2f kVAR\n'], ...
              simTime / 3600, SOC_value, P_BESS, P_total, Q_total);
 
-    % Increment simulation time
+
     simTime = simTime + time_step;
 end
 
 % Stop Simulink simulation
-set_param('COSIMsim', 'SimulationCommand', 'stop');
+set_param('COSIMsim', 'SimulationCommand' ...
+    , 'stop');
 
 % Calculating total cost based on grid consumption
 unit_price = 56;  % Price per kWh in PKR
